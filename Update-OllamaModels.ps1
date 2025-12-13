@@ -10,7 +10,8 @@
 param(
     [string[]]$Model,
     [int]$MaxParallel = 3,
-    [switch]$OnlyChanged
+    [switch]$OnlyChanged,
+    [switch]$ShowProgress
 )
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
@@ -26,9 +27,11 @@ function Get-OllamaList {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $parts = $line -split '\s{2,}'
         if ($parts.Count -ge 2) {
+            $modified = if ($parts.Count -ge 4) { $parts[3] } else { $null }
             [pscustomobject]@{
-                Name = $parts[0]
-                Id   = $parts[1]
+                Name     = $parts[0]
+                Id       = $parts[1]
+                Modified = $modified
             }
         }
     }
@@ -53,32 +56,56 @@ if (-not $targets) { Write-Host "No matching models to update."; exit 0 }
 $beforeMap = @{}
 $before | ForEach-Object { $beforeMap[$_.Name] = $_.Id }
 
-# Run pulls in parallel
-$results = $targets | ForEach-Object -Parallel {
-    # $_ is the model object passed from the pipeline
-    $name = $_.Name
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+if ($ShowProgress) {
+    # Run sequentially to keep progress output readable
+    $results = foreach ($t in $targets) {
+        $name = $t.Name
+        $sw = [Diagnostics.Stopwatch]::StartNew()
 
-    try {
-        # Run the pull; suppress noisy output but preserve exit code
-        & ollama pull $name | Out-Null
-        $exit = $LASTEXITCODE
-    } catch {
-        $exit = 1
-    }
+        Write-Host "Updating $name..."
+        try {
+            # Show raw progress output from ollama
+            & ollama pull $name
+            $exit = $LASTEXITCODE
+        } catch {
+            $exit = 1
+        }
 
-    $sw.Stop()
-    [pscustomobject]@{
-        Name     = $name
-        ExitCode = $exit
-        Seconds  = [math]::Round($sw.Elapsed.TotalSeconds,1)
+        $sw.Stop()
+        [pscustomobject]@{
+            Name     = $name
+            ExitCode = $exit
+            Seconds  = [math]::Round($sw.Elapsed.TotalSeconds,1)
+        }
     }
-} -ThrottleLimit $MaxParallel
+} else {
+    # Run pulls in parallel (quiet) to avoid noisy interleaved progress bars
+    $results = $targets | ForEach-Object -Parallel {
+        $name = $_.Name
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+
+        try {
+            & ollama pull $name > $null 2> $null
+            $exit = $LASTEXITCODE
+        } catch {
+            $exit = 1
+        }
+
+        $sw.Stop()
+        [pscustomobject]@{
+            Name     = $name
+            ExitCode = $exit
+            Seconds  = [math]::Round($sw.Elapsed.TotalSeconds,1)
+        }
+    } -ThrottleLimit $MaxParallel
+}
 
 # Inventory after
 $after = Get-OllamaList
 $afterMap = @{}
 $after | ForEach-Object { $afterMap[$_.Name] = $_.Id }
+$afterModMap = @{}
+$after | ForEach-Object { $afterModMap[$_.Name] = $_.Modified }
 
 # Summary
 $summary = $results | ForEach-Object {
@@ -86,16 +113,15 @@ $summary = $results | ForEach-Object {
     $afterId  = if ($afterMap.ContainsKey($_.Name)) { $afterMap[$_.Name] } else { $null }
     [pscustomobject]@{
         Model    = $_.Name
-        BeforeID = $beforeId
-        AfterID  = $afterId
-        Changed  = if ($afterId -and ($afterId -ne $beforeId)) { "Yes" } else { "No" }
-        Status   = if ($_.ExitCode -eq 0) { "OK" } else { "Error" }
-        Seconds  = $_.Seconds
+        Updated  = if ($afterId -and ($afterId -ne $beforeId)) { "Yes" } else { "No" }
+        Duration = if ($afterId -and ($afterId -ne $beforeId)) { $_.Seconds } else { $null }
+        LastPull = if ($afterModMap.ContainsKey($_.Name)) { $afterModMap[$_.Name] } else { $null }
     }
 }
 
 if ($OnlyChanged) {
-    $summary = $summary | Where-Object { $_.Changed -eq "Yes" -or $_.Status -ne "OK" }
+    $summary = $summary | Where-Object { $_.Updated -eq "Yes" }
 }
 
-$summary | Sort-Object Model | Format-Table -AutoSize
+# Final output: Model, Updated, Duration, LastPull
+$summary | Sort-Object Model | Format-Table Model, Updated, @{Label='Duration';Expression={$_.Duration}}, @{Label='Last Pull';Expression={$_.LastPull}} -AutoSize
